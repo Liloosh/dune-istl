@@ -31,6 +31,9 @@
 #include <dune/istl/solver.hh>
 #include <dune/istl/solverregistry.hh>
 
+#include <memory>
+#include <iostream>
+
 namespace Dune {
 
   inline bool& enableBiCGStabCallStackLog() {
@@ -38,11 +41,16 @@ namespace Dune {
       return enable;
   }
 
+  inline std::shared_ptr<std::ostream>& getCallStackLogStream() {
+      static std::shared_ptr<std::ostream> stream(&std::cout, [](std::ostream*){});
+      return stream;
+  }
+
 #ifndef DUNE_ISTL_LOG_CALLSTACK_BICGSTAB
 #define DUNE_ISTL_LOG_CALLSTACK_BICGSTAB(msg) \
   do { \
       if (::Dune::enableBiCGStabCallStackLog()) { \
-          std::cout << "[BiCGStab CallStack] " << __PRETTY_FUNCTION__ << " - " << msg << std::endl; \
+          *::Dune::getCallStackLogStream() << "[BiCGStab CallStack] " << __PRETTY_FUNCTION__ << " - " << msg << std::endl; \
       } \
   } while(0)
 #endif

@@ -376,8 +376,9 @@ namespace Dune
     void apply (X& x, X& b, double reduction, InverseOperatorResult& res) override
     {
         extern bool& enableBiCGStabCallStackLog();
+        extern std::shared_ptr<std::ostream>& getCallStackLogStream();
         if (enableBiCGStabCallStackLog()) {
-            std::cout << "[BiCGStab CallStack] Dune::IterativeSolver::apply(4 args) - solver.hh" << std::endl;
+            *getCallStackLogStream() << "[BiCGStab CallStack] Dune::IterativeSolver::apply(4 args) - solver.hh" << std::endl;
         }
       scalar_real_type saved_reduction = _reduction;
       _reduction = reduction;

@@ -32,6 +32,21 @@
 #include <dune/istl/solverregistry.hh>
 
 namespace Dune {
+
+  inline bool& enableBiCGStabCallStackLog() {
+      static bool enable = false;
+      return enable;
+  }
+
+#ifndef DUNE_ISTL_LOG_CALLSTACK_BICGSTAB
+#define DUNE_ISTL_LOG_CALLSTACK_BICGSTAB(msg) \
+  do { \
+      if (::Dune::enableBiCGStabCallStackLog()) { \
+          std::cout << "[BiCGStab CallStack] " << __PRETTY_FUNCTION__ << " - " << msg << std::endl; \
+      } \
+  } while(0)
+#endif
+
   /** @addtogroup ISTL_Solvers
       @{
    */
@@ -439,6 +454,7 @@ namespace Dune {
      */
     void apply (X& x, X& b, InverseOperatorResult& res) override
     {
+      DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Entering BiCGSTABSolver::apply");
       using std::abs;
       const Simd::Scalar<real_type> EPSILON=1e-80;
       using std::abs;
@@ -518,6 +534,7 @@ namespace Dune {
 
         // y = W^-1 * p
         y = 0;
+        DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Applying preconditioner (y = W^-1 * p)");
         _prec->apply(y,p);           // apply preconditioner
 
         // v = A * y
@@ -555,6 +572,7 @@ namespace Dune {
 
         // y = W^-1 * r
         y = 0;
+        DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Applying preconditioner (y = W^-1 * r)");
         _prec->apply(y,r);
 
         // t = A * y

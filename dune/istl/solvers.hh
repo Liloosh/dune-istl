@@ -36,6 +36,8 @@
 
 namespace Dune {
 
+#ifndef DUNE_ENABLE_BICGSTAB_CALLSTACK_LOG_DEFINED
+#define DUNE_ENABLE_BICGSTAB_CALLSTACK_LOG_DEFINED
   inline bool& enableBiCGStabCallStackLog() {
       static bool enable = false;
       return enable;
@@ -45,6 +47,7 @@ namespace Dune {
       static std::shared_ptr<std::ostream> stream(&std::cout, [](std::ostream*){});
       return stream;
   }
+#endif
 
 #ifndef DUNE_ISTL_LOG_CALLSTACK_BICGSTAB
 #define DUNE_ISTL_LOG_CALLSTACK_BICGSTAB(msg) \

@@ -27,6 +27,7 @@ install(FILES
    io.hh
    istlexception.hh
    ldl.hh
+   linearsolverprofiler.hh
    matrix.hh
    matrixindexset.hh
    matrixmarket.hh

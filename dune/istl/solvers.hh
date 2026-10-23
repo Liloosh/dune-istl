@@ -30,6 +30,7 @@
 #include <dune/istl/scalarproducts.hh>
 #include <dune/istl/solver.hh>
 #include <dune/istl/solverregistry.hh>
+#include <dune/istl/linearsolverprofiler.hh>
 
 #include <memory>
 #include <iostream>
@@ -466,6 +467,14 @@ namespace Dune {
     void apply (X& x, X& b, InverseOperatorResult& res) override
     {
       DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Entering BiCGSTABSolver::apply");
+      auto& profiler = LinearSolverProfiler::instance();
+      const bool do_profile = profiler.enabled;
+      std::chrono::high_resolution_clock::time_point t_solve_start;
+      if (__builtin_expect(do_profile, 0)) {
+          t_solve_start = std::chrono::high_resolution_clock::now();
+          ++profiler.num_solves;
+      }
+
       using std::abs;
       const Simd::Scalar<real_type> EPSILON=1e-80;
       using std::abs;
@@ -491,12 +500,22 @@ namespace Dune {
       Iteration<double> iteration(*this,res);
       _prec->pre(x,r);             // prepare preconditioner
 
-      _op->applyscaleadd(-1,x,r);  // overwrite b with defect
+      {
+        ScopedKernelTimer timer(do_profile, profiler.spmv_time, profiler.spmv_calls);
+        _op->applyscaleadd(-1,x,r);  // overwrite b with defect
+      }
 
       rt=r;
 
-      norm = _sp->norm(r);
+      {
+        ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+        norm = _sp->norm(r);
+      }
       if(iteration.step(0, norm)){
+        if (__builtin_expect(do_profile, 0)) {
+            auto t_solve_end = std::chrono::high_resolution_clock::now();
+            profiler.total_solve_time += std::chrono::duration<double>(t_solve_end - t_solve_start).count();
+        }
         _prec->post(x);
         return;
       }
@@ -518,7 +537,10 @@ namespace Dune {
         //
 
         // rho_new = < rt , r >
-        rho_new = _sp->dot(rt,r);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+          rho_new = _sp->dot(rt,r);
+        }
 
         // look if breakdown occurred
         if (Simd::allTrue(abs(rho) <= EPSILON))
@@ -535,6 +557,7 @@ namespace Dune {
           p = r;
         else
         {
+          ScopedKernelTimer timer(do_profile, profiler.vec_ops_time, profiler.vec_ops_calls);
           beta = Simd::cond(norm==field_type(0.),
                             field_type(0.), // no need for orthogonalization if norm is already 0
                             field_type(( rho_new / rho ) * ( alpha / omega )));
@@ -546,13 +569,22 @@ namespace Dune {
         // y = W^-1 * p
         y = 0;
         DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Applying preconditioner (y = W^-1 * p)");
-        _prec->apply(y,p);           // apply preconditioner
+        {
+          ScopedKernelTimer timer(do_profile, profiler.prec_apply_time, profiler.prec_apply_calls);
+          _prec->apply(y,p);           // apply preconditioner
+        }
 
         // v = A * y
-        _op->apply(y,v);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.spmv_time, profiler.spmv_calls);
+          _op->apply(y,v);
+        }
 
         // alpha = rho_new / < rt, v >
-        h = _sp->dot(rt,v);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+          h = _sp->dot(rt,v);
+        }
 
         if ( Simd::allTrue(abs(h) < EPSILON) )
           DUNE_THROW(SolverAbort,"abs(h) < EPSILON in BiCGSTAB - abs(h) "
@@ -565,17 +597,27 @@ namespace Dune {
 
         // apply first correction to x
         // x <- x + alpha y
-        x.axpy(alpha,y);
-
-        // r = r - alpha*v
-        r.axpy(-alpha,v);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.vec_ops_time, profiler.vec_ops_calls);
+          x.axpy(alpha,y);
+          // r = r - alpha*v
+          r.axpy(-alpha,v);
+        }
 
         //
         // test stop criteria
         //
 
-        norm = _sp->norm(r);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+          norm = _sp->norm(r);
+        }
         if(iteration.step(it, norm)){
+          if (__builtin_expect(do_profile, 0)) {
+              profiler.total_iterations += static_cast<uint64_t>(it + 0.5);
+              auto t_solve_end = std::chrono::high_resolution_clock::now();
+              profiler.total_solve_time += std::chrono::duration<double>(t_solve_end - t_solve_start).count();
+          }
           break;
         }
 
@@ -584,23 +626,34 @@ namespace Dune {
         // y = W^-1 * r
         y = 0;
         DUNE_ISTL_LOG_CALLSTACK_BICGSTAB("Applying preconditioner (y = W^-1 * r)");
-        _prec->apply(y,r);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.prec_apply_time, profiler.prec_apply_calls);
+          _prec->apply(y,r);
+        }
 
         // t = A * y
-        _op->apply(y,t);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.spmv_time, profiler.spmv_calls);
+          _op->apply(y,t);
+        }
 
         // omega = < t, r > / < t, t >
-        h = _sp->dot(t,t);
-        omega = Simd::cond(norm==field_type(0.),
-                           field_type(0.),
-                           field_type(_sp->dot(t,r)/h));
+        {
+          ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+          h = _sp->dot(t,t);
+          omega = Simd::cond(norm==field_type(0.),
+                             field_type(0.),
+                             field_type(_sp->dot(t,r)/h));
+        }
 
         // apply second correction to x
         // x <- x + omega y
-        x.axpy(omega,y);
-
         // r = s - omega*t (remember : r = s)
-        r.axpy(-omega,t);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.vec_ops_time, profiler.vec_ops_calls);
+          x.axpy(omega,y);
+          r.axpy(-omega,t);
+        }
 
         rho = rho_new;
 
@@ -608,11 +661,25 @@ namespace Dune {
         // test stop criteria
         //
 
-        norm = _sp->norm(r);
+        {
+          ScopedKernelTimer timer(do_profile, profiler.dot_prod_time, profiler.dot_prod_calls);
+          norm = _sp->norm(r);
+        }
         if(iteration.step(it, norm)){
+          if (__builtin_expect(do_profile, 0)) {
+              profiler.total_iterations += static_cast<uint64_t>(it);
+              auto t_solve_end = std::chrono::high_resolution_clock::now();
+              profiler.total_solve_time += std::chrono::duration<double>(t_solve_end - t_solve_start).count();
+          }
           break;
         }
       } // end for
+
+      if (__builtin_expect(do_profile && it >= _maxit, 0)) {
+          profiler.total_iterations += static_cast<uint64_t>(it);
+          auto t_solve_end = std::chrono::high_resolution_clock::now();
+          profiler.total_solve_time += std::chrono::duration<double>(t_solve_end - t_solve_start).count();
+      }
 
       _prec->post(x);                  // postprocess preconditioner
     }

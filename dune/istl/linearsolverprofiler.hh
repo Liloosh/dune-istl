@@ -706,17 +706,16 @@ public:
         std::vector<double> sum_times(num_metrics, 0.0);
 
         RankMetricsPacket my_packet = pack();
-        std::vector<RankMetricsPacket> all_packets;
-        if (mpi_rank == 0) {
-            all_packets.resize(mpi_size);
-        }
+        std::vector<RankMetricsPacket> all_packets(mpi_size > 0 ? mpi_size : 1);
 
         if (mpi_initialized && !mpi_finalized_flag && mpi_size > 1) {
             MPI_Reduce(local_times.data(), min_times.data(), num_metrics, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
             MPI_Reduce(local_times.data(), max_times.data(), num_metrics, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
             MPI_Reduce(local_times.data(), sum_times.data(), num_metrics, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
-            // Gather all rank packets to Rank 0
+            // Gather all rank packets to Rank 0.
+            // Allocate backing storage on all ranks to prevent memory corruption in
+            // tree-based / hierarchical collective gather algorithms (e.g. OpenMPI / PRRTE).
             MPI_Gather(&my_packet, sizeof(RankMetricsPacket), MPI_BYTE,
                        all_packets.data(), sizeof(RankMetricsPacket), MPI_BYTE,
                        0, MPI_COMM_WORLD);

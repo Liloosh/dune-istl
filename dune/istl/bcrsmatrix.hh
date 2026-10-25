@@ -15,6 +15,9 @@
 #include <vector>
 #include <map>
 #include <memory>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #include "istlexception.hh"
 #include "bvector.hh"
@@ -1651,15 +1654,19 @@ namespace Dune {
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,
                                  "Size mismatch: M: " << N() << "x" << M() << " y: " << y.N());
 #endif
-      ConstRowIterator endi=end();
-      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      const size_type num_rows = N();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+#endif
+      for (size_type i = 0; i < num_rows; ++i)
       {
-        y[i.index()]=0;
-        ConstColIterator endj = (*i).end();
-        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        y[i] = 0;
+        const auto& row = (*this)[i];
+        const ConstColIterator endj = row.end();
+        for (ConstColIterator j = row.begin(); j != endj; ++j)
         {
           auto&& xj = Impl::asVector(x[j.index()]);
-          auto&& yi = Impl::asVector(y[i.index()]);
+          auto&& yi = Impl::asVector(y[i]);
           Impl::asMatrix(*j).umv(xj, yi);
         }
       }
@@ -1675,15 +1682,19 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
-      ConstRowIterator endi=end();
-      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      const size_type num_rows = N();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+#endif
+      for (size_type i = 0; i < num_rows; ++i)
       {
-        ConstColIterator endj = (*i).end();
-        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        const auto& row = (*this)[i];
+        const ConstColIterator endj = row.end();
+        for (ConstColIterator j = row.begin(); j != endj; ++j)
         {
           auto&& xj = Impl::asVector(x[j.index()]);
-          auto&& yi = Impl::asVector(y[i.index()]);
-          Impl::asMatrix(*j).umv(xj,yi);
+          auto&& yi = Impl::asVector(y[i]);
+          Impl::asMatrix(*j).umv(xj, yi);
         }
       }
     }
@@ -1698,15 +1709,19 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
-      ConstRowIterator endi=end();
-      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      const size_type num_rows = N();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+#endif
+      for (size_type i = 0; i < num_rows; ++i)
       {
-        ConstColIterator endj = (*i).end();
-        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        const auto& row = (*this)[i];
+        const ConstColIterator endj = row.end();
+        for (ConstColIterator j = row.begin(); j != endj; ++j)
         {
           auto&& xj = Impl::asVector(x[j.index()]);
-          auto&& yi = Impl::asVector(y[i.index()]);
-          Impl::asMatrix(*j).mmv(xj,yi);
+          auto&& yi = Impl::asVector(y[i]);
+          Impl::asMatrix(*j).mmv(xj, yi);
         }
       }
     }
@@ -1721,15 +1736,20 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
-      ConstRowIterator endi=end();
-      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      const size_type num_rows = N();
+      const auto alpha_val = alpha;
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+#endif
+      for (size_type i = 0; i < num_rows; ++i)
       {
-        ConstColIterator endj = (*i).end();
-        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        const auto& row = (*this)[i];
+        const ConstColIterator endj = row.end();
+        for (ConstColIterator j = row.begin(); j != endj; ++j)
         {
           auto&& xj = Impl::asVector(x[j.index()]);
-          auto&& yi = Impl::asVector(y[i.index()]);
-          Impl::asMatrix(*j).usmv(alpha,xj,yi);
+          auto&& yi = Impl::asVector(y[i]);
+          Impl::asMatrix(*j).usmv(alpha_val, xj, yi);
         }
       }
     }

@@ -15,6 +15,8 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <cstdlib>
+#include <cstring>
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -37,6 +39,35 @@
  */
 
 namespace Dune {
+
+  //! Global runtime toggle for OpenMP multi-threading in SpMV kernels
+  inline bool& openmp_spmv_enabled()
+  {
+    static bool enabled = []() {
+      const char* env = std::getenv("OPM_ENABLE_OPENMP_SPMV");
+      if (!env) {
+        env = std::getenv("DUNE_ENABLE_OPENMP_SPMV");
+      }
+      if (env) {
+        return !(std::strcmp(env, "0") == 0 ||
+                 std::strcmp(env, "false") == 0 ||
+                 std::strcmp(env, "FALSE") == 0 ||
+                 std::strcmp(env, "off") == 0 ||
+                 std::strcmp(env, "OFF") == 0);
+      }
+#if defined(_OPENMP)
+      return true;
+#else
+      return false;
+#endif
+    }();
+    return enabled;
+  }
+
+  inline void set_openmp_spmv_enabled(bool flag)
+  {
+    openmp_spmv_enabled() = flag;
+  }
 
   /**
    * @defgroup ISTL_SPMV Sparse Matrix and Vector classes
@@ -1642,6 +1673,46 @@ namespace Dune {
 
     //===== linear maps
 
+    //! y = A x (Sequential implementation)
+    template<class X, class Y>
+    void mv_seq (const X& x, Y& y) const
+    {
+      ConstRowIterator endi=end();
+      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      {
+        y[i.index()]=0;
+        ConstColIterator endj = (*i).end();
+        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[i.index()]);
+          Impl::asMatrix(*j).umv(xj, yi);
+        }
+      }
+    }
+
+    //! y = A x (OpenMP multi-threaded implementation)
+    template<class X, class Y>
+    void mv_omp (const X& x, Y& y) const
+    {
+      const size_type num_rows = N();
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+#endif
+      for (size_type i = 0; i < num_rows; ++i)
+      {
+        y[i] = 0;
+        const auto& row = (*this)[i];
+        const ConstColIterator endj = row.end();
+        for (ConstColIterator j = row.begin(); j != endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[i]);
+          Impl::asMatrix(*j).umv(xj, yi);
+        }
+      }
+    }
+
     //! y = A x
     template<class X, class Y>
     void mv (const X& x, Y& y) const
@@ -1654,13 +1725,42 @@ namespace Dune {
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,
                                  "Size mismatch: M: " << N() << "x" << M() << " y: " << y.N());
 #endif
+#if defined(_OPENMP)
+      if (openmp_spmv_enabled()) {
+        mv_omp(x, y);
+        return;
+      }
+#endif
+      mv_seq(x, y);
+    }
+
+    //! y += A x (Sequential implementation)
+    template<class X, class Y>
+    void umv_seq (const X& x, Y& y) const
+    {
+      ConstRowIterator endi=end();
+      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      {
+        ConstColIterator endj = (*i).end();
+        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[i.index()]);
+          Impl::asMatrix(*j).umv(xj, yi);
+        }
+      }
+    }
+
+    //! y += A x (OpenMP multi-threaded implementation)
+    template<class X, class Y>
+    void umv_omp (const X& x, Y& y) const
+    {
       const size_type num_rows = N();
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
 #endif
       for (size_type i = 0; i < num_rows; ++i)
       {
-        y[i] = 0;
         const auto& row = (*this)[i];
         const ConstColIterator endj = row.end();
         for (ConstColIterator j = row.begin(); j != endj; ++j)
@@ -1682,33 +1782,36 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
-      const size_type num_rows = N();
 #if defined(_OPENMP)
-#pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
+      if (openmp_spmv_enabled()) {
+        umv_omp(x, y);
+        return;
+      }
 #endif
-      for (size_type i = 0; i < num_rows; ++i)
+      umv_seq(x, y);
+    }
+
+    //! y -= A x (Sequential implementation)
+    template<class X, class Y>
+    void mmv_seq (const X& x, Y& y) const
+    {
+      ConstRowIterator endi=end();
+      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
       {
-        const auto& row = (*this)[i];
-        const ConstColIterator endj = row.end();
-        for (ConstColIterator j = row.begin(); j != endj; ++j)
+        ConstColIterator endj = (*i).end();
+        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
         {
           auto&& xj = Impl::asVector(x[j.index()]);
-          auto&& yi = Impl::asVector(y[i]);
-          Impl::asMatrix(*j).umv(xj, yi);
+          auto&& yi = Impl::asVector(y[i.index()]);
+          Impl::asMatrix(*j).mmv(xj, yi);
         }
       }
     }
 
-    //! y -= A x
+    //! y -= A x (OpenMP multi-threaded implementation)
     template<class X, class Y>
-    void mmv (const X& x, Y& y) const
+    void mmv_omp (const X& x, Y& y) const
     {
-#ifdef DUNE_ISTL_WITH_CHECKING
-      if (ready != built)
-        DUNE_THROW(BCRSMatrixError,"You can only call arithmetic operations on fully built BCRSMatrix instances");
-      if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
-      if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
-#endif
       const size_type num_rows = N();
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static) default(shared) if(num_rows >= 512)
@@ -1726,9 +1829,9 @@ namespace Dune {
       }
     }
 
-    //! y += alpha A x
-    template<class X, class Y, class F>
-    void usmv (F&& alpha, const X& x, Y& y) const
+    //! y -= A x
+    template<class X, class Y>
+    void mmv (const X& x, Y& y) const
     {
 #ifdef DUNE_ISTL_WITH_CHECKING
       if (ready != built)
@@ -1736,6 +1839,36 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
+#if defined(_OPENMP)
+      if (openmp_spmv_enabled()) {
+        mmv_omp(x, y);
+        return;
+      }
+#endif
+      mmv_seq(x, y);
+    }
+
+    //! y += alpha A x (Sequential implementation)
+    template<class X, class Y, class F>
+    void usmv_seq (const F& alpha, const X& x, Y& y) const
+    {
+      ConstRowIterator endi=end();
+      for (ConstRowIterator i=this->begin(); i!=endi; ++i)
+      {
+        ConstColIterator endj = (*i).end();
+        for (ConstColIterator j=(*i).begin(); j!=endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[i.index()]);
+          Impl::asMatrix(*j).usmv(alpha, xj, yi);
+        }
+      }
+    }
+
+    //! y += alpha A x (OpenMP multi-threaded implementation)
+    template<class X, class Y, class F>
+    void usmv_omp (const F& alpha, const X& x, Y& y) const
+    {
       const size_type num_rows = N();
       const auto alpha_val = alpha;
 #if defined(_OPENMP)
@@ -1752,6 +1885,25 @@ namespace Dune {
           Impl::asMatrix(*j).usmv(alpha_val, xj, yi);
         }
       }
+    }
+
+    //! y += alpha A x
+    template<class X, class Y, class F>
+    void usmv (F&& alpha, const X& x, Y& y) const
+    {
+#ifdef DUNE_ISTL_WITH_CHECKING
+      if (ready != built)
+        DUNE_THROW(BCRSMatrixError,"You can only call arithmetic operations on fully built BCRSMatrix instances");
+      if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
+      if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
+#endif
+#if defined(_OPENMP)
+      if (openmp_spmv_enabled()) {
+        usmv_omp(alpha, x, y);
+        return;
+      }
+#endif
+      usmv_seq(alpha, x, y);
     }
 
     //! y = A^T x

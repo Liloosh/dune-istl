@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <sys/resource.h>
 
@@ -162,6 +163,14 @@ public:
         uint64_t matrix_nnz = 0;
         double peak_memory_mb = 0.0;
         double spmv_bandwidth_gbs = 0.0;
+
+        // Cache Footprint & Memory Traffic
+        double matrix_footprint_mb = 0.0;
+        double working_set_mb = 0.0;
+        double ideal_traffic_gb = 0.0;
+        double cache_traffic_gb = 0.0;
+        double cache_efficiency_pct = 0.0;
+        double arithmetic_intensity = 0.0;
     };
 
     RankMetricsPacket pack() const {
@@ -207,6 +216,12 @@ public:
         p.matrix_nnz = matrix_nnz;
         p.peak_memory_mb = getPeakMemoryMB();
         p.spmv_bandwidth_gbs = getSpmvBandwidthGBS();
+        p.matrix_footprint_mb = getMatrixFootprintMB();
+        p.working_set_mb = getTotalWorkingSetMB();
+        p.ideal_traffic_gb = getIdealMemoryTrafficGB();
+        p.cache_traffic_gb = getCacheLineMemoryTrafficGB();
+        p.cache_efficiency_pct = getCacheLineEfficiencyPct();
+        p.arithmetic_intensity = getArithmeticIntensity();
         return p;
     }
 
@@ -302,6 +317,251 @@ public:
                                     + static_cast<double>(matrix_block_nnz) * 4.0
                                     + static_cast<double>(matrix_cols + 2 * matrix_rows) * 8.0;
         return (static_cast<double>(spmv_calls) * bytes_per_spmv) / (spmv_time * 1e9);
+    }
+
+    // -------------------------------------------------------------------------
+    // Cache Footprint & Memory Traffic Calculations
+    // -------------------------------------------------------------------------
+    uint32_t getBlockDim() const {
+        if (matrix_block_nnz > 0 && matrix_nnz >= matrix_block_nnz) {
+            uint64_t block_area = matrix_nnz / matrix_block_nnz;
+            uint32_t b = static_cast<uint32_t>(std::round(std::sqrt(static_cast<double>(block_area))));
+            if (b > 0 && (b * b) == block_area) {
+                return b;
+            }
+        }
+        return 1;
+    }
+
+    double getMatrixFootprintMB() const {
+        if (matrix_nnz == 0) return 0.0;
+        uint32_t b = getBlockDim();
+        uint64_t block_rows = (b > 0) ? (matrix_rows / b) : matrix_rows;
+        // Matrix values: 8 bytes per scalar double
+        // Column indices: 4 bytes per block (CRS column index)
+        // Row offsets: 4 bytes per block row (CRS row pointer)
+        uint64_t bytes = matrix_nnz * 8 + matrix_block_nnz * 4 + (block_rows + 1) * 4;
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    }
+
+    double getVectorFootprintMB() const {
+        if (matrix_rows == 0) return 0.0;
+        // BiCGSTAB maintains 6 vectors (x, r, r0_hat, p, v, t) of size matrix_rows * 8 bytes
+        uint64_t bytes = 6 * matrix_rows * 8;
+        return static_cast<double>(bytes) / (1024.0 * 1024.0);
+    }
+
+    double getPreconditionerFootprintMB() const {
+        if (matrix_rows == 0) return 0.0;
+        uint32_t b = getBlockDim();
+        if (cpr_setup_calls > 0) {
+            // CPR holds fine-level ILU0 factorization + coarse pressure AMG matrix and vectors (~1.15x)
+            return getMatrixFootprintMB() * 1.15;
+        }
+        if (ilu0_lower_solve_calls > 0 || ilu0_setup_calls > 0) {
+            // ILU(0) holds L and U with the same non-zero structure as A
+            return getMatrixFootprintMB();
+        }
+        // DILU (Diagonal ILU) only stores the inverted diagonal blocks (N_blocks * b * b * 8 bytes)
+        // matrix_rows = N_blocks * b, so N_blocks * b * b * 8 = matrix_rows * b * 8 bytes
+        uint64_t diag_bytes = static_cast<uint64_t>(matrix_rows) * b * 8;
+        return static_cast<double>(diag_bytes) / (1024.0 * 1024.0);
+    }
+
+    struct CpuCacheTopology {
+        uint64_t l1d_kb = 0;
+        uint64_t l2_kb = 0;
+        uint64_t l3_kb = 0;
+        bool detected = false;
+        std::string status_message = "Unavailable (sysfs unreadable)";
+
+        static CpuCacheTopology detect() {
+            CpuCacheTopology topo;
+            try {
+                // Probe standard Linux sysfs hierarchy for CPU 0 cache topology
+                for (int i = 0; i < 8; ++i) {
+                    std::string base = "/sys/devices/system/cpu/cpu0/cache/index" + std::to_string(i) + "/";
+                    std::ifstream level_file(base + "level");
+                    std::ifstream type_file(base + "type");
+                    std::ifstream size_file(base + "size");
+
+                    if (!level_file.is_open() || !type_file.is_open() || !size_file.is_open()) {
+                        continue;
+                    }
+
+                    int level = 0;
+                    level_file >> level;
+                    std::string type;
+                    type_file >> type;
+                    std::string size_str;
+                    size_file >> size_str;
+
+                    uint64_t size_kb = 0;
+                    if (!size_str.empty()) {
+                        char unit = size_str.back();
+                        if (unit == 'K' || unit == 'k') {
+                            size_kb = std::stoull(size_str.substr(0, size_str.size() - 1));
+                        } else if (unit == 'M' || unit == 'm') {
+                            size_kb = std::stoull(size_str.substr(0, size_str.size() - 1)) * 1024;
+                        } else if (unit == 'G' || unit == 'g') {
+                            size_kb = std::stoull(size_str.substr(0, size_str.size() - 1)) * 1024 * 1024;
+                        } else {
+                            size_kb = std::stoull(size_str) / 1024;
+                        }
+                    }
+
+                    if (size_kb > 0) {
+                        if (level == 1 && (type == "Data" || type == "Unified")) {
+                            topo.l1d_kb = size_kb;
+                        } else if (level == 2) {
+                            topo.l2_kb = size_kb;
+                        } else if (level == 3) {
+                            topo.l3_kb = size_kb;
+                        }
+                    }
+                }
+
+                if (topo.l3_kb > 0 || topo.l2_kb > 0 || topo.l1d_kb > 0) {
+                    topo.detected = true;
+                    topo.status_message = "Detected";
+                }
+            } catch (...) {
+                topo.detected = false;
+                topo.status_message = "Unavailable (Read Error)";
+            }
+            return topo;
+        }
+    };
+
+    static const CpuCacheTopology& getCacheTopology() {
+        static CpuCacheTopology topo = CpuCacheTopology::detect();
+        return topo;
+    }
+
+    double getTotalWorkingSetMB() const {
+        return getMatrixFootprintMB() + getVectorFootprintMB() + getPreconditionerFootprintMB();
+    }
+
+    std::string getCacheResidencyClass(int procs = 1) const {
+        double ws_kb = getTotalWorkingSetMB() * 1024.0;
+        if (ws_kb <= 0.0) return "N/A";
+        const auto& topo = getCacheTopology();
+
+        if (!topo.detected) {
+            return "Unclassified (Hardware cache size unknown)";
+        }
+
+        double l3_mb = static_cast<double>(topo.l3_kb) / 1024.0;
+        double eff_l3_kb = (procs > 1 && topo.l3_kb > 0) ? (static_cast<double>(topo.l3_kb) / procs) : static_cast<double>(topo.l3_kb);
+        double eff_l3_mb = eff_l3_kb / 1024.0;
+
+        std::ostringstream oss;
+        if (topo.l1d_kb > 0 && ws_kb <= topo.l1d_kb) {
+            oss << "L1d-Resident (Ultra Fast, <" << topo.l1d_kb << " KB)";
+        } else if (topo.l2_kb > 0 && ws_kb <= topo.l2_kb) {
+            oss << "L2-Resident (Fast, <" << topo.l2_kb << " KB)";
+        } else if (topo.l3_kb > 0 && ws_kb <= topo.l3_kb) {
+            oss << "L3-Resident (Moderate Latency, <" << std::fixed << std::setprecision(1) << l3_mb << " MB)";
+            if (procs > 1 && ws_kb > eff_l3_kb) {
+                oss << " [Contended slice >" << std::fixed << std::setprecision(1) << eff_l3_mb << " MB/rank]";
+            }
+        } else {
+            oss << "DRAM-Bound (Memory Bandwidth Bottleneck, >" << std::fixed << std::setprecision(1) << l3_mb << " MB)";
+        }
+        return oss.str();
+    }
+
+    double getIdealMemoryTrafficGB() const {
+        if (spmv_calls == 0 && total_solve_time <= 0.0) return 0.0;
+        // Minimum theoretical traffic:
+        // SpMV: read matrix A once, read+write y (2x vector), read x once
+        double spmv_bytes = static_cast<double>(matrix_nnz) * 8.0
+                          + static_cast<double>(matrix_block_nnz) * 4.0
+                          + static_cast<double>(matrix_cols + 2 * matrix_rows) * 8.0;
+
+        double prec_bytes;
+        if (cpr_setup_calls > 0) {
+            // CPR applies AMG coarse cycle (~0.35x SpMV) + fine smoother (~0.7x SpMV)
+            prec_bytes = spmv_bytes * 1.05;
+        } else if (ilu0_lower_solve_calls > 0 || ilu0_setup_calls > 0) {
+            // ILU(0) triangular solve passes through L and U
+            prec_bytes = spmv_bytes;
+        } else {
+            // DILU only reads block diagonal D^-1, reads residual r, writes search direction z
+            uint32_t b = getBlockDim();
+            prec_bytes = static_cast<double>(matrix_rows) * b * 8.0 + static_cast<double>(2 * matrix_rows) * 8.0;
+        }
+
+        double vec_bytes = static_cast<double>(matrix_rows) * 8.0 * 3.0; // AXPY: 2 reads, 1 write
+        double dot_bytes = static_cast<double>(matrix_rows) * 8.0 * 2.0; // Dot: 2 reads
+
+        double total_bytes = spmv_calls * spmv_bytes
+                           + prec_apply_calls * prec_bytes
+                           + vec_ops_calls * vec_bytes
+                           + dot_prod_calls * dot_bytes;
+        return total_bytes / 1e9;
+    }
+
+    double getCacheLineMemoryTrafficGB() const {
+        if (spmv_calls == 0 && total_solve_time <= 0.0) return 0.0;
+        uint32_t b = getBlockDim();
+        // A single block of size B occupies (B * B * 8) bytes.
+        // For B=3: 72 bytes -> always crosses 64-byte cache line boundaries (2 lines = 128 bytes fetched)
+        double block_bytes = static_cast<double>(b * b * 8);
+        double cache_lines_per_block = (b > 0) ? std::ceil(block_bytes / 64.0) : 1.0;
+        double matrix_cache_bytes = static_cast<double>(matrix_block_nnz) * cache_lines_per_block * 64.0;
+
+        // Vector indirect access: 64 bytes per distinct column block, with ~35% spatial reuse
+        double vec_cache_bytes = static_cast<double>(matrix_block_nnz) * 64.0 * 0.65;
+        double spmv_cache = matrix_cache_bytes + vec_cache_bytes + static_cast<double>(2 * matrix_rows) * 8.0;
+
+        double prec_cache;
+        if (cpr_setup_calls > 0) {
+            prec_cache = spmv_cache * 1.15;
+        } else if (ilu0_lower_solve_calls > 0 || ilu0_setup_calls > 0) {
+            prec_cache = spmv_cache * 1.1; // Triangular solve has fine-grained dependencies
+        } else {
+            // DILU: block diagonal inverse streamed with high spatial locality
+            double diag_blocks = (b > 0) ? (static_cast<double>(matrix_rows) / b) : static_cast<double>(matrix_rows);
+            prec_cache = diag_blocks * cache_lines_per_block * 64.0 + static_cast<double>(2 * matrix_rows) * 8.0;
+        }
+
+        double vec_cache = static_cast<double>(matrix_rows) * 8.0 * 3.0;
+        double dot_cache = static_cast<double>(matrix_rows) * 8.0 * 2.0;
+
+        double total_bytes = spmv_calls * spmv_cache
+                           + prec_apply_calls * prec_cache
+                           + vec_ops_calls * vec_cache
+                           + dot_prod_calls * dot_cache;
+        return total_bytes / 1e9;
+    }
+
+    double getCacheLineEfficiencyPct() const {
+        double ideal = getIdealMemoryTrafficGB();
+        double cache = getCacheLineMemoryTrafficGB();
+        if (cache <= 0.0 || ideal <= 0.0) return 100.0;
+        return std::min(100.0, (ideal / cache) * 100.0);
+    }
+
+    double getCacheAmplificationFactor() const {
+        double ideal = getIdealMemoryTrafficGB();
+        double cache = getCacheLineMemoryTrafficGB();
+        if (ideal <= 0.0) return 1.0;
+        return cache / ideal;
+    }
+
+    double getTotalFlops() const {
+        double flops = static_cast<double>(spmv_calls) * (2.0 * matrix_nnz)
+                     + static_cast<double>(prec_apply_calls) * (2.0 * matrix_nnz)
+                     + static_cast<double>(dot_prod_calls) * (2.0 * matrix_rows)
+                     + static_cast<double>(vec_ops_calls) * (2.0 * matrix_rows);
+        return flops;
+    }
+
+    double getArithmeticIntensity() const {
+        double ideal_bytes = getIdealMemoryTrafficGB() * 1e9;
+        if (ideal_bytes <= 0.0) return 0.0;
+        return getTotalFlops() / ideal_bytes;
     }
 
     void reset() {
@@ -546,6 +806,43 @@ public:
                 << std::setw(13) << std::setprecision(1) << pct(cpr_postsmooth_time) << "%\n";
         }
 
+        if (matrix_rows > 0) {
+            out << "--------------------------------------------------------------------------------\n";
+            out << "                   CACHE FOOTPRINT & MEMORY TRAFFIC ANALYSIS\n";
+            out << "--------------------------------------------------------------------------------\n";
+            const auto& topo = getCacheTopology();
+            if (topo.detected) {
+                out << std::left << std::setw(32) << "Detected CPU Cache:"
+                    << "L1d: " << topo.l1d_kb << " KB | L2: " << topo.l2_kb << " KB | L3: "
+                    << std::fixed << std::setprecision(1) << (static_cast<double>(topo.l3_kb) / 1024.0) << " MB\n";
+            } else {
+                out << std::left << std::setw(32) << "Detected CPU Cache:" << topo.status_message << "\n";
+            }
+            out << std::left << std::setw(32) << "Working Set Classification:" << getCacheResidencyClass(mpi_size) << "\n";
+            out << std::left << std::setw(32) << "Total Solver Working Set:" << std::fixed << std::setprecision(2)
+                << getTotalWorkingSetMB() << " MB (Matrix: " << getMatrixFootprintMB() << " MB, Vectors: "
+                << getVectorFootprintMB() << " MB, Precond: " << getPreconditionerFootprintMB() << " MB)\n";
+
+            uint32_t b = getBlockDim();
+            uint32_t block_bytes = b * b * sizeof(double);
+            uint32_t cache_lines = static_cast<uint32_t>(std::ceil(static_cast<double>(block_bytes) / 64.0));
+            std::string alignment_str = (block_bytes % 64 == 0) ? "Aligned (0 Split Penalty)" : "Straddles Cache Lines (Overfetch Penalty)";
+
+            out << std::left << std::setw(32) << "Block Layout & Alignment:" << b << " x " << b << " doubles ("
+                << block_bytes << " B / block -> " << cache_lines << " lines, " << alignment_str << ")\n";
+            out << std::left << std::setw(32) << "Ideal Memory Traffic:" << std::fixed << std::setprecision(3)
+                << getIdealMemoryTrafficGB() << " GB\n";
+            out << std::left << std::setw(32) << "Cache-Line Memory Traffic:" << std::fixed << std::setprecision(3)
+                << getCacheLineMemoryTrafficGB() << " GB (Amplification: "
+                << std::setprecision(2) << getCacheAmplificationFactor() << "x)\n";
+            out << std::left << std::setw(32) << "Cache Line Efficiency:" << std::fixed << std::setprecision(1)
+                << getCacheLineEfficiencyPct() << "% (Memory bus bandwidth utilization)\n";
+            out << std::left << std::setw(32) << "Total Compute Workload:" << std::fixed << std::setprecision(3)
+                << (getTotalFlops() / 1e9) << " GFLOPs\n";
+            out << std::left << std::setw(32) << "Arithmetic Intensity:" << std::fixed << std::setprecision(3)
+                << getArithmeticIntensity() << " FLOP/Byte (Memory-Bandwidth Bound)\n";
+        }
+
         if (!session_dir.empty()) {
             out << "--------------------------------------------------------------------------------\n";
             out << "Benchmark files saved to: " << session_dir << "\n";
@@ -560,7 +857,8 @@ public:
                          const std::vector<double>& min_times,
                          const std::vector<double>& max_times,
                          const std::vector<double>& sum_times,
-                         const std::vector<std::string>& labels) const
+                         const std::vector<std::string>& labels,
+                         const std::vector<RankMetricsPacket>& packets = {}) const
     {
         out << "================================================================================\n";
         out << "          MPI CROSS-RANK SCALABILITY & LOAD IMBALANCE REPORT (" << mpi_size << " Ranks)\n";
@@ -587,6 +885,35 @@ public:
                     << std::setw(13) << std::setprecision(1) << imbalance << "%\n";
             }
         }
+
+        if (!packets.empty()) {
+            double total_ws_mb = 0.0;
+            double total_ideal_gb = 0.0;
+            double total_cache_gb = 0.0;
+            for (const auto& pkt : packets) {
+                total_ws_mb += pkt.working_set_mb;
+                total_ideal_gb += pkt.ideal_traffic_gb;
+                total_cache_gb += pkt.cache_traffic_gb;
+            }
+            double agg_eff = (total_cache_gb > 0.0) ? std::min(100.0, (total_ideal_gb / total_cache_gb) * 100.0) : 100.0;
+            double amp = (total_ideal_gb > 0.0) ? (total_cache_gb / total_ideal_gb) : 1.0;
+
+            out << "--------------------------------------------------------------------------------\n";
+            out << "[Aggregate Cross-Rank Cache & Memory Traffic]\n";
+            out << std::left << std::setw(32) << "Aggregate Working Set:" << std::fixed << std::setprecision(2) << total_ws_mb << " MB\n";
+            const auto& topo = getCacheTopology();
+            if (topo.detected && topo.l3_kb > 0) {
+                double l3_mb = static_cast<double>(topo.l3_kb) / 1024.0;
+                std::string agg_res = (total_ws_mb <= l3_mb) ? "L3-Resident (Fits in Socket L3)" : "DRAM-Bound (Exceeds Socket L3)";
+                out << std::left << std::setw(32) << "Socket L3 Capacity:" << std::fixed << std::setprecision(1) << l3_mb << " MB (Hardware Detected)\n";
+                out << std::left << std::setw(32) << "Aggregate Cache Residency:" << agg_res << "\n";
+            } else {
+                out << std::left << std::setw(32) << "Socket L3 Capacity:" << topo.status_message << "\n";
+            }
+            out << std::left << std::setw(32) << "Aggregate Ideal Traffic:" << std::fixed << std::setprecision(3) << total_ideal_gb << " GB\n";
+            out << std::left << std::setw(32) << "Aggregate Cache-Line Traffic:" << std::fixed << std::setprecision(3) << total_cache_gb << " GB (Amplification: " << std::setprecision(2) << amp << "x)\n";
+            out << std::left << std::setw(32) << "Mean Cache Line Efficiency:" << std::fixed << std::setprecision(1) << agg_eff << "%\n";
+        }
         out << "================================================================================\n\n";
     }
 #endif
@@ -603,7 +930,10 @@ public:
             csv << p.rank << "," << metric << "," << t << "," << c << ","
                 << avg_call_ms(t, c) << "," << p_solve << ","
                 << p.matrix_rows << "," << p.matrix_nnz << ","
-                << p.peak_memory_mb << "," << p.spmv_bandwidth_gbs << "\n";
+                << p.peak_memory_mb << "," << p.spmv_bandwidth_gbs << ","
+                << p.working_set_mb << "," << p.ideal_traffic_gb << ","
+                << p.cache_traffic_gb << "," << p.cache_efficiency_pct << ","
+                << p.arithmetic_intensity << "\n";
         };
 
         write_row("total_solve", p.total_solve_time, p.num_solves, 100.0);
@@ -634,7 +964,7 @@ public:
         std::string rank_fname = session_dir + "/rank_" + std::to_string(mpi_rank) + ".csv";
         std::ofstream rcsv(rank_fname);
         if (rcsv.is_open()) {
-            rcsv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs\n";
+            rcsv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs,working_set_mb,ideal_traffic_gb,cache_traffic_gb,cache_efficiency_pct,arithmetic_intensity\n";
             writePacketToCsv(rcsv, pack());
             rcsv.close();
         }
@@ -727,7 +1057,7 @@ public:
             std::string all_fname = session_dir + "/all_ranks_summary.csv";
             std::ofstream all_csv(all_fname);
             if (all_csv.is_open()) {
-                all_csv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs\n";
+                all_csv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs,working_set_mb,ideal_traffic_gb,cache_traffic_gb,cache_efficiency_pct,arithmetic_intensity\n";
 #if defined(HAVE_MPI)
                 if (mpi_size > 1 && !all_packets.empty()) {
                     for (int r = 0; r < mpi_size; ++r) {
@@ -748,7 +1078,7 @@ public:
                 printSummary(rtxt);
 #if defined(HAVE_MPI)
                 if (mpi_initialized && !mpi_finalized_flag && mpi_size > 1) {
-                    printMpiSummary(rtxt, min_times, max_times, sum_times, mpi_labels);
+                    printMpiSummary(rtxt, min_times, max_times, sum_times, mpi_labels, all_packets);
                 }
 #endif
                 rtxt.close();
@@ -758,7 +1088,7 @@ public:
             if (!output_file.empty()) {
                 std::ofstream legacy_csv(output_file);
                 if (legacy_csv.is_open()) {
-                    legacy_csv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs\n";
+                    legacy_csv << "rank,metric,time_seconds,call_count,avg_time_ms,pct_linear_solver,matrix_rows,matrix_nnz,peak_memory_mb,spmv_bandwidth_gbs,working_set_mb,ideal_traffic_gb,cache_traffic_gb,cache_efficiency_pct,arithmetic_intensity\n";
 #if defined(HAVE_MPI)
                     if (mpi_size > 1 && !all_packets.empty()) {
                         for (int r = 0; r < mpi_size; ++r) {

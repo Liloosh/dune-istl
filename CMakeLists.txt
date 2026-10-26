@@ -21,13 +21,13 @@ list(APPEND CMAKE_MODULE_PATH ${dune-common_MODULE_PATH}
 include(DuneMacros)
 
 # deactivate global include-directories
-dune_policy(SET DP_DEFAULT_INCLUDE_DIRS NEW)
+# dune_policy(SET DP_DEFAULT_INCLUDE_DIRS NEW)
 
 # deactivate global calls to add_dune_all_flags in tests
-dune_policy(SET DP_TEST_ADD_ALL_FLAGS NEW)
+# dune_policy(SET DP_TEST_ADD_ALL_FLAGS NEW)
 
 # do not make all suggested dependencies required automatically
-dune_policy(SET DP_SUGGESTED_MODULE_DEPENDENCIES_REQUIRED_DOWNSTREAM NEW)
+# dune_policy(SET DP_SUGGESTED_MODULE_DEPENDENCIES_REQUIRED_DOWNSTREAM NEW)
 
 # start a dune project with information from dune.module
 dune_project()
@@ -38,7 +38,8 @@ dune_add_library(duneistl INTERFACE
   LINK_LIBRARIES Dune::Common)
 
 # set include directories to target
-dune_default_include_directories(duneistl INTERFACE)
+# dune_default_include_directories(duneistl INTERFACE)
+target_include_directories(duneistl INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}> $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}>)
 
 add_subdirectory(cmake/modules)
 add_subdirectory(dune)

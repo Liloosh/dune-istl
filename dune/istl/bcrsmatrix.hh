@@ -69,6 +69,31 @@ namespace Dune {
     openmp_spmv_enabled() = flag;
   }
 
+  //! Global runtime toggle for 2-row register blocking optimization in SpMV kernels
+  inline bool& spmv_2row_blocking_enabled()
+  {
+    static bool enabled = []() {
+      const char* env = std::getenv("OPM_ENABLE_2ROW_BLOCKING");
+      if (!env) {
+        env = std::getenv("DUNE_ENABLE_2ROW_BLOCKING");
+      }
+      if (env) {
+        return (std::strcmp(env, "1") == 0 ||
+                std::strcmp(env, "true") == 0 ||
+                std::strcmp(env, "TRUE") == 0 ||
+                std::strcmp(env, "on") == 0 ||
+                std::strcmp(env, "ON") == 0);
+      }
+      return false;
+    }();
+    return enabled;
+  }
+
+  inline void set_spmv_2row_blocking_enabled(bool flag)
+  {
+    spmv_2row_blocking_enabled() = flag;
+  }
+
   /**
    * @defgroup ISTL_SPMV Sparse Matrix and Vector classes
    * @ingroup ISTL
@@ -1713,6 +1738,95 @@ namespace Dune {
       }
     }
 
+    //! y = A x (2-row register blocked implementation for improved cache line reuse)
+    template<class X, class Y>
+    void mv_2row_blocked (const X& x, Y& y) const
+    {
+      const size_type num_rows = N();
+      const size_type pairs = num_rows / 2;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(openmp_spmv_enabled() && pairs >= 256)
+#endif
+      for (size_type p = 0; p < pairs; ++p)
+      {
+        size_type i0 = 2 * p;
+        size_type i1 = i0 + 1;
+
+        y[i0] = 0;
+        y[i1] = 0;
+
+        const auto& row0 = (*this)[i0];
+        const auto& row1 = (*this)[i1];
+
+        auto it0 = row0.begin();
+        const auto end0 = row0.end();
+        auto it1 = row1.begin();
+        const auto end1 = row1.end();
+
+        while (it0 != end0 && it1 != end1)
+        {
+          size_type col0 = it0.index();
+          size_type col1 = it1.index();
+
+          if (col0 == col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it0).umv(xj, yi0);
+            Impl::asMatrix(*it1).umv(xj, yi1);
+            ++it0;
+            ++it1;
+          }
+          else if (col0 < col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            Impl::asMatrix(*it0).umv(xj, yi0);
+            ++it0;
+          }
+          else
+          {
+            auto&& xj = Impl::asVector(x[col1]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it1).umv(xj, yi1);
+            ++it1;
+          }
+        }
+
+        while (it0 != end0)
+        {
+          auto&& xj = Impl::asVector(x[it0.index()]);
+          auto&& yi0 = Impl::asVector(y[i0]);
+          Impl::asMatrix(*it0).umv(xj, yi0);
+          ++it0;
+        }
+
+        while (it1 != end1)
+        {
+          auto&& xj = Impl::asVector(x[it1.index()]);
+          auto&& yi1 = Impl::asVector(y[i1]);
+          Impl::asMatrix(*it1).umv(xj, yi1);
+          ++it1;
+        }
+      }
+
+      if (num_rows % 2 != 0)
+      {
+        size_type last = num_rows - 1;
+        y[last] = 0;
+        const auto& row = (*this)[last];
+        const auto endj = row.end();
+        for (auto j = row.begin(); j != endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[last]);
+          Impl::asMatrix(*j).umv(xj, yi);
+        }
+      }
+    }
+
     //! y = A x
     template<class X, class Y>
     void mv (const X& x, Y& y) const
@@ -1725,6 +1839,10 @@ namespace Dune {
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,
                                  "Size mismatch: M: " << N() << "x" << M() << " y: " << y.N());
 #endif
+      if (spmv_2row_blocking_enabled()) {
+        mv_2row_blocked(x, y);
+        return;
+      }
 #if defined(_OPENMP)
       if (openmp_spmv_enabled()) {
         mv_omp(x, y);
@@ -1772,6 +1890,91 @@ namespace Dune {
       }
     }
 
+    //! y += A x (2-row register blocked implementation for improved cache line reuse)
+    template<class X, class Y>
+    void umv_2row_blocked (const X& x, Y& y) const
+    {
+      const size_type num_rows = N();
+      const size_type pairs = num_rows / 2;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(openmp_spmv_enabled() && pairs >= 256)
+#endif
+      for (size_type p = 0; p < pairs; ++p)
+      {
+        size_type i0 = 2 * p;
+        size_type i1 = i0 + 1;
+
+        const auto& row0 = (*this)[i0];
+        const auto& row1 = (*this)[i1];
+
+        auto it0 = row0.begin();
+        const auto end0 = row0.end();
+        auto it1 = row1.begin();
+        const auto end1 = row1.end();
+
+        while (it0 != end0 && it1 != end1)
+        {
+          size_type col0 = it0.index();
+          size_type col1 = it1.index();
+
+          if (col0 == col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it0).umv(xj, yi0);
+            Impl::asMatrix(*it1).umv(xj, yi1);
+            ++it0;
+            ++it1;
+          }
+          else if (col0 < col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            Impl::asMatrix(*it0).umv(xj, yi0);
+            ++it0;
+          }
+          else
+          {
+            auto&& xj = Impl::asVector(x[col1]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it1).umv(xj, yi1);
+            ++it1;
+          }
+        }
+
+        while (it0 != end0)
+        {
+          auto&& xj = Impl::asVector(x[it0.index()]);
+          auto&& yi0 = Impl::asVector(y[i0]);
+          Impl::asMatrix(*it0).umv(xj, yi0);
+          ++it0;
+        }
+
+        while (it1 != end1)
+        {
+          auto&& xj = Impl::asVector(x[it1.index()]);
+          auto&& yi1 = Impl::asVector(y[i1]);
+          Impl::asMatrix(*it1).umv(xj, yi1);
+          ++it1;
+        }
+      }
+
+      if (num_rows % 2 != 0)
+      {
+        size_type last = num_rows - 1;
+        const auto& row = (*this)[last];
+        const auto endj = row.end();
+        for (auto j = row.begin(); j != endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[last]);
+          Impl::asMatrix(*j).umv(xj, yi);
+        }
+      }
+    }
+
     //! y += A x
     template<class X, class Y>
     void umv (const X& x, Y& y) const
@@ -1782,6 +1985,10 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
+      if (spmv_2row_blocking_enabled()) {
+        umv_2row_blocked(x, y);
+        return;
+      }
 #if defined(_OPENMP)
       if (openmp_spmv_enabled()) {
         umv_omp(x, y);
@@ -1829,6 +2036,91 @@ namespace Dune {
       }
     }
 
+    //! y -= A x (2-row register blocked implementation for improved cache line reuse)
+    template<class X, class Y>
+    void mmv_2row_blocked (const X& x, Y& y) const
+    {
+      const size_type num_rows = N();
+      const size_type pairs = num_rows / 2;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(openmp_spmv_enabled() && pairs >= 256)
+#endif
+      for (size_type p = 0; p < pairs; ++p)
+      {
+        size_type i0 = 2 * p;
+        size_type i1 = i0 + 1;
+
+        const auto& row0 = (*this)[i0];
+        const auto& row1 = (*this)[i1];
+
+        auto it0 = row0.begin();
+        const auto end0 = row0.end();
+        auto it1 = row1.begin();
+        const auto end1 = row1.end();
+
+        while (it0 != end0 && it1 != end1)
+        {
+          size_type col0 = it0.index();
+          size_type col1 = it1.index();
+
+          if (col0 == col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it0).mmv(xj, yi0);
+            Impl::asMatrix(*it1).mmv(xj, yi1);
+            ++it0;
+            ++it1;
+          }
+          else if (col0 < col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            Impl::asMatrix(*it0).mmv(xj, yi0);
+            ++it0;
+          }
+          else
+          {
+            auto&& xj = Impl::asVector(x[col1]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it1).mmv(xj, yi1);
+            ++it1;
+          }
+        }
+
+        while (it0 != end0)
+        {
+          auto&& xj = Impl::asVector(x[it0.index()]);
+          auto&& yi0 = Impl::asVector(y[i0]);
+          Impl::asMatrix(*it0).mmv(xj, yi0);
+          ++it0;
+        }
+
+        while (it1 != end1)
+        {
+          auto&& xj = Impl::asVector(x[it1.index()]);
+          auto&& yi1 = Impl::asVector(y[i1]);
+          Impl::asMatrix(*it1).mmv(xj, yi1);
+          ++it1;
+        }
+      }
+
+      if (num_rows % 2 != 0)
+      {
+        size_type last = num_rows - 1;
+        const auto& row = (*this)[last];
+        const auto endj = row.end();
+        for (auto j = row.begin(); j != endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[last]);
+          Impl::asMatrix(*j).mmv(xj, yi);
+        }
+      }
+    }
+
     //! y -= A x
     template<class X, class Y>
     void mmv (const X& x, Y& y) const
@@ -1839,6 +2131,10 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
+      if (spmv_2row_blocking_enabled()) {
+        mmv_2row_blocked(x, y);
+        return;
+      }
 #if defined(_OPENMP)
       if (openmp_spmv_enabled()) {
         mmv_omp(x, y);
@@ -1887,6 +2183,92 @@ namespace Dune {
       }
     }
 
+    //! y += alpha A x (2-row register blocked implementation for improved cache line reuse)
+    template<class X, class Y, class F>
+    void usmv_2row_blocked (const F& alpha, const X& x, Y& y) const
+    {
+      const size_type num_rows = N();
+      const size_type pairs = num_rows / 2;
+      const auto alpha_val = alpha;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) default(shared) if(openmp_spmv_enabled() && pairs >= 256)
+#endif
+      for (size_type p = 0; p < pairs; ++p)
+      {
+        size_type i0 = 2 * p;
+        size_type i1 = i0 + 1;
+
+        const auto& row0 = (*this)[i0];
+        const auto& row1 = (*this)[i1];
+
+        auto it0 = row0.begin();
+        const auto end0 = row0.end();
+        auto it1 = row1.begin();
+        const auto end1 = row1.end();
+
+        while (it0 != end0 && it1 != end1)
+        {
+          size_type col0 = it0.index();
+          size_type col1 = it1.index();
+
+          if (col0 == col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it0).usmv(alpha_val, xj, yi0);
+            Impl::asMatrix(*it1).usmv(alpha_val, xj, yi1);
+            ++it0;
+            ++it1;
+          }
+          else if (col0 < col1)
+          {
+            auto&& xj = Impl::asVector(x[col0]);
+            auto&& yi0 = Impl::asVector(y[i0]);
+            Impl::asMatrix(*it0).usmv(alpha_val, xj, yi0);
+            ++it0;
+          }
+          else
+          {
+            auto&& xj = Impl::asVector(x[col1]);
+            auto&& yi1 = Impl::asVector(y[i1]);
+            Impl::asMatrix(*it1).usmv(alpha_val, xj, yi1);
+            ++it1;
+          }
+        }
+
+        while (it0 != end0)
+        {
+          auto&& xj = Impl::asVector(x[it0.index()]);
+          auto&& yi0 = Impl::asVector(y[i0]);
+          Impl::asMatrix(*it0).usmv(alpha_val, xj, yi0);
+          ++it0;
+        }
+
+        while (it1 != end1)
+        {
+          auto&& xj = Impl::asVector(x[it1.index()]);
+          auto&& yi1 = Impl::asVector(y[i1]);
+          Impl::asMatrix(*it1).usmv(alpha_val, xj, yi1);
+          ++it1;
+        }
+      }
+
+      if (num_rows % 2 != 0)
+      {
+        size_type last = num_rows - 1;
+        const auto& row = (*this)[last];
+        const auto endj = row.end();
+        for (auto j = row.begin(); j != endj; ++j)
+        {
+          auto&& xj = Impl::asVector(x[j.index()]);
+          auto&& yi = Impl::asVector(y[last]);
+          Impl::asMatrix(*j).usmv(alpha_val, xj, yi);
+        }
+      }
+    }
+
     //! y += alpha A x
     template<class X, class Y, class F>
     void usmv (F&& alpha, const X& x, Y& y) const
@@ -1897,6 +2279,10 @@ namespace Dune {
       if (x.N()!=M()) DUNE_THROW(BCRSMatrixError,"index out of range");
       if (y.N()!=N()) DUNE_THROW(BCRSMatrixError,"index out of range");
 #endif
+      if (spmv_2row_blocking_enabled()) {
+        usmv_2row_blocked(alpha, x, y);
+        return;
+      }
 #if defined(_OPENMP)
       if (openmp_spmv_enabled()) {
         usmv_omp(alpha, x, y);
